@@ -171,7 +171,7 @@ public static class WvwExportBuilder
                     StartedAt = source.StartedAt,
                     DurationMs = source.DurationMs,
                     EventDomainEndMs = GetEventDomainEndMs(
-                        log.LogData.LogDuration, log.LogData.EvtcLogEnd),
+                        log.LogData.LogDuration, log.LogData.EvtcLogEnd, source.Events),
                     HealingAvailable = log.CombatData.HasEXTHealing,
                     Build = source.Build,
                     Outcome = source.Outcome,
@@ -531,13 +531,14 @@ public static class WvwExportBuilder
 
     internal static bool TryAddHealingEventOnce(HashSet<object> seen, object healing) => seen.Add(healing);
 
-    internal static long GetEventDomainEndMs(long activeFightEndMs, long recordingEndMs)
+    internal static long GetEventDomainEndMs(
+        long activeFightEndMs, long recordingEndMs, IEnumerable<WvwExportEvent> events)
     {
         if (recordingEndMs < activeFightEndMs)
         {
             throw new InvalidDataException("EVTC recording end precedes the active WvW fight end.");
         }
-        return recordingEndMs;
+        return Math.Max(recordingEndMs, events.Select(evt => (long)evt.TimeMs).DefaultIfEmpty(0).Max());
     }
 
     internal static bool IsExportableBuffEvent(BuffEvent buff) =>

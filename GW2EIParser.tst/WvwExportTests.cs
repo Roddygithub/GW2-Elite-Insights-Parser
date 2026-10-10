@@ -201,10 +201,13 @@ public sealed class WvwExportTests
     [Test]
     public void V2EventDomainRetainsEventsAfterActiveFightEnd()
     {
-        long eventDomainEnd = WvwExportBuilder.GetEventDomainEndMs(56_789, 57_100);
+        WvwExportEvent derivedTail = WvwExportBuilder.CreateBuffEvent(
+            "buff_remove_single", 56_974, "actor", "actor", -51, 0, 1);
+        long eventDomainEnd = WvwExportBuilder.GetEventDomainEndMs(56_789, 56_789, [derivedTail]);
 
         Assert.That(56_974, Is.GreaterThan(56_789).And.LessThanOrEqualTo(eventDomainEnd));
-        Assert.Throws<InvalidDataException>(() => WvwExportBuilder.GetEventDomainEndMs(100, 99));
+        Assert.That(eventDomainEnd, Is.EqualTo(56_974));
+        Assert.Throws<InvalidDataException>(() => WvwExportBuilder.GetEventDomainEndMs(100, 99, []));
     }
 
     [Test]
