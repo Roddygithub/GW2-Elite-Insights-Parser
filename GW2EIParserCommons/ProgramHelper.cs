@@ -58,7 +58,7 @@ public sealed class ProgramHelper : IDisposable
     internal readonly static HTMLAssets htmlAssets = new();
     private static readonly System.Text.Json.JsonSerializerOptions WvwExportJsonOptions = new()
     {
-        PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.CamelCase,
+        PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.SnakeCaseLower,
         WriteIndented = true,
     };
 
@@ -266,6 +266,7 @@ public sealed class ProgramHelper : IDisposable
                             ComputeMechanics = true,
                             ComputePhases = true,
                             DetailedWvWParse = Settings.DetailledWvW,
+                            CaptureOwnershipObservations = Settings.SaveOutWvwExport,
                             ParseExtensions = true,
                             ComputeDamageModifiers = true,
                             ComputeBuff = true,
@@ -375,6 +376,7 @@ public sealed class ProgramHelper : IDisposable
                 ComputeCast = Settings.ComputeCast,
                 ComputeMechanics = Settings.ComputeMechanics,
                 DetailedWvWParse = Settings.DetailledWvW,
+                CaptureOwnershipObservations = Settings.SaveOutWvwExport,
             },
                                         APIController);
 

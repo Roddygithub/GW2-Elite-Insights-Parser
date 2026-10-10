@@ -9,6 +9,131 @@ namespace GW2EIBuilders;
 
 public static class WvwExportBuilder
 {
+    internal readonly record struct ActorOrderKey(
+        long FirstAware,
+        long LastAware,
+        AgentItem.AgentType Type,
+        ushort InstanceId,
+        int SpeciesId,
+        string Name,
+        ulong SourceAgent);
+
+    internal readonly record struct ActorIdAssignment<T>(T Agent, string ActorId);
+
+    internal readonly record struct OwnershipObservationForExport(
+        string AgentId,
+        long AgentFirstAwareMs,
+        long AgentLastAwareMs,
+        long ObservedAtMs,
+        string? OwnerActorId,
+        int SourceOrder);
+
+    internal static List<ActorIdAssignment<T>> AssignActorIds<T>(
+        IEnumerable<T> agents,
+        Func<T, ActorOrderKey> keySelector)
+    {
+        return agents.Select(agent => (Agent: agent, Key: keySelector(agent)))
+            .OrderBy(x => x.Key.FirstAware)
+            .ThenBy(x => x.Key.LastAware)
+            .ThenBy(x => x.Key.Type)
+            .ThenBy(x => x.Key.InstanceId)
+            .ThenBy(x => x.Key.SpeciesId)
+            .ThenBy(x => x.Key.Name, StringComparer.Ordinal)
+            .ThenBy(x => x.Key.SourceAgent)
+            .Select((value, index) => new ActorIdAssignment<T>(value.Agent, $"a{index:D6}"))
+            .ToList();
+    }
+
+    internal static List<WvwExportEvent> SequenceEvents(IEnumerable<WvwExportEvent> events)
+    {
+        return events.Select(evt => (
+                Event: evt,
+                Source: evt switch
+                {
+                    WvwDamageEvent damageSource => damageSource.SourceActorId,
+                    WvwBuffEvent buffSource => buffSource.SourceActorId,
+                    _ => null,
+                },
+                Target: evt switch
+                {
+                    WvwDamageEvent damageTarget => damageTarget.TargetActorId,
+                    WvwBuffEvent buffTarget => buffTarget.TargetActorId,
+                    WvwLifecycleEvent lifecycle => lifecycle.TargetActorId,
+                    _ => null,
+                },
+                Skill: evt switch
+                {
+                    WvwDamageEvent damageSkill => damageSkill.SkillId,
+                    WvwBuffEvent buffSkill => buffSkill.BuffId,
+                    _ => (long?)null,
+                },
+                Damage: evt is WvwDamageEvent damageValue ? damageValue.Damage : (long?)null,
+                ShieldDamage: evt is WvwDamageEvent shieldValue ? shieldValue.ShieldDamage : (long?)null,
+                Duration: evt is WvwBuffEvent buff ? buff.DurationMs : (long?)null,
+                Stacks: evt is WvwBuffRemovalEvent removal ? removal.RemovedStacks : (int?)null,
+                Health: evt is WvwHealthUpdateEvent health ? health.HealthPercent : (double?)null))
+            .OrderBy(x => x.Event.TimeMs)
+            .ThenBy(x => x.Event.Kind, StringComparer.Ordinal)
+            .ThenBy(x => x.Source, StringComparer.Ordinal)
+            .ThenBy(x => x.Target, StringComparer.Ordinal)
+            .ThenBy(x => x.Skill)
+            .ThenBy(x => x.Damage)
+            .ThenBy(x => x.ShieldDamage)
+            .ThenBy(x => x.Duration)
+            .ThenBy(x => x.Stacks)
+            .ThenBy(x => x.Health)
+            .Select((value, index) => value.Event with { Sequence = index })
+            .ToList();
+    }
+
+    internal static List<WvwOwnershipInterval> BuildOwnershipIntervals(
+        IEnumerable<OwnershipObservationForExport> source)
+    {
+        return BuildOwnershipProjection(source).Intervals;
+    }
+
+    internal static (List<WvwOwnershipInterval> Intervals, int ObservationCount, int SameTimeCollisionCount)
+        BuildOwnershipProjection(IEnumerable<OwnershipObservationForExport> source)
+    {
+        var sourceList = source.ToList();
+        var intervals = new List<WvwOwnershipInterval>();
+        int sameTimeCollisions = sourceList.GroupBy(x => (x.AgentId, x.ObservedAtMs))
+            .Sum(group => group.Count() - 1);
+        foreach (var observations in sourceList.GroupBy(x => x.AgentId, StringComparer.Ordinal))
+        {
+            var ordered = observations.OrderBy(x => x.ObservedAtMs)
+                .ThenBy(x => x.SourceOrder)
+                .GroupBy(x => x.ObservedAtMs)
+                .Select(group => group.Last())
+                .ToList();
+            for (int index = 0; index < ordered.Count; index++)
+            {
+                var observation = ordered[index];
+                long endMs = index + 1 < ordered.Count
+                    ? ordered[index + 1].ObservedAtMs
+                    : observation.AgentLastAwareMs;
+                if (endMs <= observation.ObservedAtMs)
+                {
+                    continue;
+                }
+                intervals.Add(new WvwOwnershipInterval
+                {
+                    AgentId = observation.AgentId,
+                    OwnerActorId = observation.OwnerActorId,
+                    OwnerResolution = observation.OwnerActorId is null ? "unresolved" : "resolved",
+                    StartMs = observation.ObservedAtMs,
+                    EndMs = endMs,
+                    StartBasis = "master_observation",
+                    EndBasis = index + 1 < ordered.Count ? "master_observation" : "agent_awareness",
+                });
+            }
+        }
+        return (intervals.OrderBy(x => x.AgentId, StringComparer.Ordinal)
+            .ThenBy(x => x.StartMs)
+            .ThenBy(x => x.OwnerActorId, StringComparer.Ordinal)
+            .ToList(), sourceList.Count, sameTimeCollisions);
+    }
+
     public static WvwExportDocument Build(ParsedEvtcLog log, Version parserVersion)
     {
         if (!log.ParserSettings.DetailedWvWParse || log.LogData.Logic.ParseMode != LogLogic.ParseModeEnum.WvW)
@@ -16,26 +141,27 @@ public static class WvwExportBuilder
             throw new InvalidDataException("WvW export requires a detailed-WvW parse.");
         }
 
-        var agents = Enum.GetValues<AgentItem.AgentType>()
-            .SelectMany(log.AgentData.GetAgentByType)
-            .Distinct()
-            .OrderBy(x => x.FirstAware)
-            .ThenBy(x => x.LastAware)
-            .ThenBy(x => x.Type)
-            .ThenBy(x => x.InstID)
-            .ThenBy(x => x.ID)
-            .ThenBy(x => x.Name, StringComparer.Ordinal)
-            .ThenBy(x => x.Agent)
-            .ToList();
-        var actorIds = agents.Select((agent, index) => (agent, id: $"a{index:D6}"))
-            .ToDictionary(x => x.agent, x => x.id);
+        var actorAssignments = AssignActorIds(
+            Enum.GetValues<AgentItem.AgentType>().SelectMany(log.AgentData.GetAgentByType).Distinct(),
+            agent => new ActorOrderKey(
+                agent.FirstAware,
+                agent.LastAware,
+                agent.Type,
+                agent.InstID,
+                agent.ID,
+                agent.Name,
+                agent.Agent));
+        var agents = actorAssignments.Select(x => x.Agent).ToList();
+        var actorIds = actorAssignments.ToDictionary(x => x.Agent, x => x.ActorId);
+        var agentByActorId = actorAssignments.ToDictionary(x => x.ActorId, x => x.Agent, StringComparer.Ordinal);
         string? ActorId(AgentItem agent, long time)
         {
             if (agent.IsUnknown)
             {
                 return null;
             }
-            if (actorIds.TryGetValue(agent, out string? actorId))
+            if (actorIds.TryGetValue(agent, out string? actorId) &&
+                agent.FirstAware <= time && time <= agent.LastAware)
             {
                 return actorId;
             }
@@ -80,32 +206,29 @@ public static class WvwExportBuilder
                     : null,
                 InstanceId = agent.InstID == 0 ? null : agent.InstID,
                 SpeciesId = agent.ID < 0 ? null : agent.ID,
-                FirstAwareMs = Math.Clamp(agent.FirstAware - log.LogData.LogStart, 0, duration),
-                LastAwareMs = Math.Clamp(agent.LastAware - log.LogData.LogStart, 0, duration),
+                FirstAwareMs = RelativeTime(agent.FirstAware, log),
+                LastAwareMs = RelativeTime(agent.LastAware, log),
             };
         }).ToList();
 
         var events = new List<WvwExportEvent>();
-        var seenBuffEvents = new HashSet<BuffEvent>(ReferenceEqualityComparer.Instance);
+        var seenBuffEvents = new HashSet<object>(ReferenceEqualityComparer.Instance);
         foreach (AgentItem agent in agents)
         {
             foreach (HealthDamageEvent damage in log.CombatData.GetDamageData(agent))
             {
-                events.Add(new WvwExportEvent
-                {
-                    Kind = "damage",
-                    TimeMs = Time(damage.Time, log),
-                    SourceActorId = ActorId(damage.From, damage.Time),
-                    TargetActorId = ActorId(damage.To, damage.Time),
-                    SkillId = damage.SkillID,
-                    Damage = Math.Max(0, damage.HealthDamage),
-                    ShieldDamage = Math.Max(0, damage.ShieldDamage),
-                });
+                events.Add(CreateDamageEvent(
+                    Time(damage.Time, log),
+                    ActorId(damage.From, damage.Time),
+                    ActorId(damage.To, damage.Time),
+                    damage.SkillID,
+                    Math.Max(0, damage.HealthDamage),
+                    Math.Max(0, damage.ShieldDamage)));
             }
 
             foreach (BuffEvent buff in log.CombatData.GetBuffDataByDst(agent))
             {
-                if (seenBuffEvents.Add(buff))
+                if (IsExportableBuffEvent(buff) && TryAddBuffEventOnce(seenBuffEvents, buff))
                 {
                     events.Add(BuffEventDto(buff, log, ActorId));
                 }
@@ -118,66 +241,37 @@ public static class WvwExportBuilder
             AddStatus(log.CombatData.GetDespawnEvents(agent), "despawn", log, ActorId, events);
             foreach (HealthUpdateEvent health in log.CombatData.GetHealthUpdateEvents(agent))
             {
-                events.Add(new WvwExportEvent
-                {
-                    Kind = "health_update",
-                    TimeMs = Time(health.Time, log),
-                    TargetActorId = ActorId(health.Src, health.Time),
-                    HealthPercent = health.HealthPercent,
-                });
+                events.Add(CreateLifecycleEvent(
+                    "health_update",
+                    Time(health.Time, log),
+                    ActorId(health.Src, health.Time),
+                    health.HealthPercent));
             }
         }
 
-        events = events.OrderBy(x => x.TimeMs)
-            .ThenBy(x => x.Kind, StringComparer.Ordinal)
-            .ThenBy(x => x.SourceActorId, StringComparer.Ordinal)
-            .ThenBy(x => x.TargetActorId, StringComparer.Ordinal)
-            .ThenBy(x => x.SkillId)
-            .ThenBy(x => x.Damage)
-            .ThenBy(x => x.BuffId)
-            .ThenBy(x => x.BuffDurationMs)
-            .ThenBy(x => x.RemovedStacks)
-            .Select((value, index) => value with { Sequence = index })
-            .ToList();
+        events = SequenceEvents(events);
 
-        var intervals = new List<WvwOwnershipInterval>();
+        var ownershipObservations = new List<OwnershipObservationForExport>();
         foreach (AgentItem agent in agents)
         {
             if (!actorIds.TryGetValue(agent, out string? agentId))
             {
                 continue;
             }
-            var observations = agent.OwnershipObservations
-                .Select((observation, index) => (observation, index))
-                .OrderBy(x => x.observation.Time)
-                .ThenBy(x => x.index)
-                .GroupBy(x => x.observation.Time)
-                .Select(group => group.Last().observation)
-                .ToList();
-            for (int index = 0; index < observations.Count; index++)
+            for (int index = 0; index < agent.OwnershipObservations.Count; index++)
             {
-                var observation = observations[index];
-                var end = index + 1 < observations.Count ? observations[index + 1].Time : agent.LastAware;
-                long startMs = Math.Clamp(observation.Time - log.LogData.LogStart, 0, log.LogData.LogDuration);
-                long endMs = Math.Clamp(end - log.LogData.LogStart, 0, log.LogData.LogDuration);
-                string? ownerActorId = ActorId(observation.Owner, observation.Time);
-                if (endMs > startMs && ownerActorId != null)
-                {
-                    intervals.Add(new WvwOwnershipInterval
-                    {
-                        AgentId = agentId,
-                        OwnerActorId = ownerActorId,
-                        StartMs = startMs,
-                        EndMs = endMs,
-                        BoundaryBasis = "master_observation",
-                    });
-                }
+                var observation = agent.OwnershipObservations[index];
+                ownershipObservations.Add(new OwnershipObservationForExport(
+                    agentId,
+                    RelativeTime(agent.FirstAware, log),
+                    RelativeTime(agent.LastAware, log),
+                    RelativeTime(observation.Time, log),
+                    ActorId(observation.Owner, observation.Time),
+                    index));
             }
         }
-        intervals = intervals.OrderBy(x => x.AgentId, StringComparer.Ordinal)
-            .ThenBy(x => x.StartMs)
-            .ThenBy(x => x.OwnerActorId, StringComparer.Ordinal)
-            .ToList();
+        var ownershipProjection = BuildOwnershipProjection(ownershipObservations);
+        var intervals = ownershipProjection.Intervals;
 
         var positions = new List<WvwPositionSample>();
         if (log.CanCombatReplay)
@@ -190,14 +284,8 @@ public static class WvwExportBuilder
                     var actorId = ActorId(position.Src, position.Time);
                     if (actorId != null)
                     {
-                        positions.Add(new WvwPositionSample
-                        {
-                            ActorId = actorId,
-                            TimeMs = Time(position.Time, log),
-                            X = point.X,
-                            Y = point.Y,
-                            Z = point.Z,
-                        });
+                        positions.Add(CreatePositionSample(
+                            actorId, Time(position.Time, log), point.X, point.Y, point.Z));
                     }
                 }
             }
@@ -208,6 +296,34 @@ public static class WvwExportBuilder
             .ThenBy(x => x.Y)
             .ThenBy(x => x.Z)
             .ToList();
+
+        var referencedActorIds = new HashSet<string>(StringComparer.Ordinal);
+        foreach (WvwExportEvent evt in events)
+        {
+            string? sourceId = evt switch
+            {
+                WvwDamageEvent damage => damage.SourceActorId,
+                WvwBuffEvent buff => buff.SourceActorId,
+                _ => null,
+            };
+            string? targetId = evt switch
+            {
+                WvwDamageEvent damage => damage.TargetActorId,
+                WvwBuffEvent buff => buff.TargetActorId,
+                WvwLifecycleEvent lifecycle => lifecycle.TargetActorId,
+                _ => null,
+            };
+            if (sourceId != null) referencedActorIds.Add(sourceId);
+            if (targetId != null) referencedActorIds.Add(targetId);
+        }
+        referencedActorIds.UnionWith(positions.Select(x => x.ActorId));
+        foreach (WvwOwnershipInterval interval in intervals)
+        {
+            referencedActorIds.Add(interval.AgentId);
+            if (interval.OwnerActorId != null) referencedActorIds.Add(interval.OwnerActorId);
+        }
+        actorDtos = actorDtos.Where(actor =>
+            !agentByActorId[actor.ActorId].IsFake || referencedActorIds.Contains(actor.ActorId)).ToList();
 
         DateTimeOffset? startedAt = DateTimeOffset.TryParse(
             log.LogMetadata.DateStartStd,
@@ -236,59 +352,157 @@ public static class WvwExportBuilder
                     Actors = actorDtos,
                     Events = events,
                     OwnershipIntervals = intervals,
+                    OwnershipObservationCount = ownershipProjection.ObservationCount,
+                    OwnershipSameTimeCollisionCount = ownershipProjection.SameTimeCollisionCount,
                     PositionSamples = positions,
                 },
             ],
         };
     }
 
-    private static int Time(long time, ParsedEvtcLog log) =>
-        (int)Math.Clamp(time - log.LogData.LogStart, 0, log.LogData.LogDuration);
+    private static int Time(long time, ParsedEvtcLog log) => checked((int)RelativeTime(time, log));
+
+    private static long RelativeTime(long time, ParsedEvtcLog log) => time - log.LogData.LogStart;
+
+    internal static WvwDamageEvent CreateDamageEvent(
+        int timeMs,
+        string? sourceActorId,
+        string? targetActorId,
+        long skillId,
+        long damage,
+        long shieldDamage) => new()
+    {
+        TimeMs = timeMs,
+        SourceActorId = sourceActorId,
+        TargetActorId = targetActorId,
+        SkillId = skillId,
+        Damage = damage,
+        ShieldDamage = shieldDamage,
+    };
+
+    internal static bool TryAddBuffEventOnce(HashSet<object> seen, object buff) => seen.Add(buff);
+
+    internal static bool IsExportableBuffEvent(BuffEvent buff) =>
+        IsExportableBuffEventType(buff.GetType(), buff.BuffID);
+
+    internal static bool IsExportableBuffEventType(Type type, long buffId) =>
+        !typeof(BuffStackEvent).IsAssignableFrom(type) && buffId != GW2EIEvtcParser.SkillIDs.NoBuff;
+
+    internal static WvwExportEvent CreateLifecycleEvent(
+        string kind,
+        int timeMs,
+        string? targetActorId,
+        double healthPercent = 0) => kind switch
+    {
+        "down" => new WvwDownEvent { TimeMs = timeMs, TargetActorId = targetActorId },
+        "death" => new WvwDeathEvent { TimeMs = timeMs, TargetActorId = targetActorId },
+        "alive" => new WvwAliveEvent { TimeMs = timeMs, TargetActorId = targetActorId },
+        "spawn" => new WvwSpawnEvent { TimeMs = timeMs, TargetActorId = targetActorId },
+        "despawn" => new WvwDespawnEvent { TimeMs = timeMs, TargetActorId = targetActorId },
+        "health_update" => new WvwHealthUpdateEvent
+        {
+            TimeMs = timeMs,
+            TargetActorId = targetActorId,
+            HealthPercent = healthPercent,
+        },
+        _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, "Unsupported lifecycle kind"),
+    };
+
+    internal static WvwPositionSample CreatePositionSample(
+        string actorId, int timeMs, float x, float y, float z) => new()
+    {
+        ActorId = actorId,
+        TimeMs = timeMs,
+        X = x,
+        Y = y,
+        Z = z,
+    };
 
     private static WvwExportEvent BuffEventDto(
         BuffEvent buff,
         ParsedEvtcLog log,
         Func<AgentItem, long, string?> actorId)
     {
-        var result = new WvwExportEvent
-        {
-            TimeMs = Time(buff.Time, log),
-            SourceActorId = actorId(buff.By, buff.Time),
-            TargetActorId = actorId(buff.To, buff.Time),
-            SkillId = buff.BuffID,
-            BuffId = buff.BuffID,
-        };
+        int timeMs = Time(buff.Time, log);
+        string? sourceActorId = actorId(buff.By, buff.Time);
+        string? targetActorId = actorId(buff.To, buff.Time);
         switch (buff)
         {
             case BuffApplyEvent apply:
-                return result with { Kind = "buff_apply", BuffDurationMs = Math.Max(0, apply.AppliedDuration) };
+                return CreateBuffEvent("buff_apply", timeMs, sourceActorId, targetActorId,
+                    buff.BuffID, Math.Max(0, apply.AppliedDuration));
             case BuffExtensionEvent extension:
-                return result with { Kind = "buff_extension", BuffDurationMs = Math.Max(0, extension.ExtendedDuration) };
+                return CreateBuffEvent("buff_extension", timeMs, sourceActorId, targetActorId,
+                    buff.BuffID, Math.Max(0, extension.ExtendedDuration));
             case BuffRemoveAllEvent removeAll:
-                return result with
-                {
-                    Kind = "buff_remove_all",
-                    BuffDurationMs = Math.Max(0, removeAll.RemovedDuration),
-                    RemovedStacks = Math.Max(0, removeAll.RemovedStacks),
-                };
+                return CreateBuffEvent("buff_remove_all", timeMs, sourceActorId, targetActorId,
+                    buff.BuffID, Math.Max(0, removeAll.RemovedDuration),
+                    Math.Max(0, removeAll.RemovedStacks));
             case BuffRemoveSingleEvent removeSingle:
-                return result with
-                {
-                    Kind = "buff_remove_single",
-                    BuffDurationMs = Math.Max(0, removeSingle.RemovedDuration),
-                    RemovedStacks = 1,
-                };
+                return CreateBuffEvent("buff_remove_single", timeMs, sourceActorId, targetActorId,
+                    buff.BuffID, Math.Max(0, removeSingle.RemovedDuration), 1);
             case BuffRemoveManualEvent removeManual:
-                return result with
-                {
-                    Kind = "buff_remove_manual",
-                    BuffDurationMs = Math.Max(0, removeManual.RemovedDuration),
-                    RemovedStacks = 1,
-                };
+                return CreateBuffEvent("buff_remove_manual", timeMs, sourceActorId, targetActorId,
+                    buff.BuffID, Math.Max(0, removeManual.RemovedDuration), 1);
             default:
                 throw new InvalidDataException($"Unsupported WvW buff event type: {buff.GetType().Name}");
         }
     }
+
+    internal static WvwExportEvent CreateBuffEvent(
+        string kind,
+        int timeMs,
+        string? sourceActorId,
+        string? targetActorId,
+        long buffId,
+        long durationMs,
+        int? removedStacks = null) => kind switch
+    {
+        "buff_apply" => new WvwBuffApplyEvent
+        {
+            TimeMs = timeMs,
+            SourceActorId = sourceActorId,
+            TargetActorId = targetActorId,
+            BuffId = buffId,
+            DurationMs = durationMs,
+        },
+        "buff_extension" => new WvwBuffExtensionEvent
+        {
+            TimeMs = timeMs,
+            SourceActorId = sourceActorId,
+            TargetActorId = targetActorId,
+            BuffId = buffId,
+            DurationMs = durationMs,
+        },
+        "buff_remove_all" => new WvwBuffRemoveAllEvent
+        {
+            TimeMs = timeMs,
+            SourceActorId = sourceActorId,
+            TargetActorId = targetActorId,
+            BuffId = buffId,
+            DurationMs = durationMs,
+            RemovedStacks = removedStacks ?? 0,
+        },
+        "buff_remove_single" => new WvwBuffRemoveSingleEvent
+        {
+            TimeMs = timeMs,
+            SourceActorId = sourceActorId,
+            TargetActorId = targetActorId,
+            BuffId = buffId,
+            DurationMs = durationMs,
+            RemovedStacks = removedStacks ?? 0,
+        },
+        "buff_remove_manual" => new WvwBuffRemoveManualEvent
+        {
+            TimeMs = timeMs,
+            SourceActorId = sourceActorId,
+            TargetActorId = targetActorId,
+            BuffId = buffId,
+            DurationMs = durationMs,
+            RemovedStacks = removedStacks ?? 0,
+        },
+        _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, "Unsupported buff kind"),
+    };
 
     private static void AddStatus<T>(
         IReadOnlyList<T> statusEvents,
@@ -299,12 +513,10 @@ public static class WvwExportBuilder
     {
         foreach (StatusEvent status in statusEvents)
         {
-            output.Add(new WvwExportEvent
-            {
-                Kind = kind,
-                TimeMs = Time(status.Time, log),
-                TargetActorId = actorId(status.Src, status.Time),
-            });
+            output.Add(CreateLifecycleEvent(
+                kind,
+                Time(status.Time, log),
+                actorId(status.Src, status.Time)));
         }
     }
 }

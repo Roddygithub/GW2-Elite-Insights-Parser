@@ -16,6 +16,7 @@ public class EvtcParserSettings
     public readonly long TooShortLimit;
     public readonly long TooBigLimit;
     public bool DetailedWvWParse { get; init; } = false;
+    public bool CaptureOwnershipObservations { get; init; } = false;
 
     public EvtcParserSettings(long tooShortLimit, long tooBigLimit)
     {
