@@ -12,6 +12,7 @@ public sealed class WvwExportTests
     private static readonly int[] ExpectedSequences = [0, 1, 2];
     private static readonly int[] ExpectedTimes = [10, 20, 20];
     private static readonly string[] ExpectedKinds = ["damage", "death", "down"];
+    private static readonly string[] ExpectedActorIds = ["a000000", "a000001"];
 
     private sealed record TestActor(string Name, WvwExportBuilder.ActorOrderKey Key);
 
@@ -164,12 +165,23 @@ public sealed class WvwExportTests
     [Test]
     public void V2ActorOrderingIgnoresUnstableInstanceMetadata()
     {
-        var first = WvwExportBuilder.CreateActorOrderKey(
-            10, 100, AgentItem.AgentType.Player, 123, 42, "same", 0x1234, omitInstanceId: true);
-        var repeatedParse = WvwExportBuilder.CreateActorOrderKey(
-            10, 100, AgentItem.AgentType.Player, 999, 42, "same", 0x1234, omitInstanceId: true);
+        var firstParse = new[]
+        {
+            Actor("late", 20, 0x5678, 123),
+            Actor("early", 10, 0x1234, 42),
+        };
+        var repeatedParse = new[]
+        {
+            Actor("early", 10, 0x1234, 999),
+            Actor("late", 20, 0x5678, 777),
+        };
 
-        Assert.That(first, Is.EqualTo(repeatedParse));
+        var first = WvwExportBuilder.AssignActorIds(firstParse, actor => actor.Key);
+        var repeated = WvwExportBuilder.AssignActorIds(repeatedParse, actor => actor.Key);
+
+        Assert.That(first.Select(item => (item.Agent.Name, item.ActorId)),
+            Is.EqualTo(repeated.Select(item => (item.Agent.Name, item.ActorId))));
+        Assert.That(first.Select(item => item.ActorId), Is.EqualTo(ExpectedActorIds));
     }
 
     [Test]
@@ -199,13 +211,22 @@ public sealed class WvwExportTests
     }
 
     [Test]
-    public void V2EventDomainRetainsEventsAfterActiveFightEnd()
+    public void V2EventDomainUsesLaterRawRecordingEndWhenItCoversEvents()
+    {
+        WvwExportEvent derivedTail = WvwExportBuilder.CreateBuffEvent(
+            "buff_remove_single", 56_974, "actor", "actor", -51, 0, 1);
+        long eventDomainEnd = WvwExportBuilder.GetEventDomainEndMs(56_789, 60_000, [derivedTail]);
+
+        Assert.That(eventDomainEnd, Is.EqualTo(60_000));
+    }
+
+    [Test]
+    public void V2EventDomainIncludesCanonicalEventAfterRawRecordingEnd()
     {
         WvwExportEvent derivedTail = WvwExportBuilder.CreateBuffEvent(
             "buff_remove_single", 56_974, "actor", "actor", -51, 0, 1);
         long eventDomainEnd = WvwExportBuilder.GetEventDomainEndMs(56_789, 56_789, [derivedTail]);
 
-        Assert.That(56_974, Is.GreaterThan(56_789).And.LessThanOrEqualTo(eventDomainEnd));
         Assert.That(eventDomainEnd, Is.EqualTo(56_974));
         Assert.Throws<InvalidDataException>(() => WvwExportBuilder.GetEventDomainEndMs(100, 99, []));
     }
@@ -220,16 +241,18 @@ public sealed class WvwExportTests
         Assert.That(WvwExportBuilder.TryAddHealingEventOnce(seen, eventRecord), Is.False);
     }
 
-    private static TestActor Actor(string name, long firstAware, ulong sourceAgent) => new(
+    private static TestActor Actor(
+        string name, long firstAware, ulong sourceAgent, ushort instanceId = 1) => new(
         name,
-        new WvwExportBuilder.ActorOrderKey(
+        WvwExportBuilder.CreateActorOrderKey(
             firstAware,
             firstAware + 10,
-            GW2EIEvtcParser.ParsedData.AgentItem.AgentType.Player,
-            1,
+            AgentItem.AgentType.Player,
+            instanceId,
             42,
             name,
-            sourceAgent));
+            sourceAgent,
+            omitInstanceId: true));
 
     private static WvwExportBuilder.OwnershipObservationForExport Ownership(
         string agentId, string? ownerActorId, long at, int sourceOrder) => new(
