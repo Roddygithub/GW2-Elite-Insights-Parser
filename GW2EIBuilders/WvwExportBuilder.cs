@@ -5,6 +5,7 @@ using GW2EIEvtcParser.ParsedData;
 using GW2EIEvtcParser.LogLogic;
 using GW2EIEvtcParser.Extensions;
 using GW2EIJSON;
+using static GW2EIEvtcParser.ArcDPSEnums;
 
 namespace GW2EIBuilders;
 
@@ -153,6 +154,10 @@ public static class WvwExportBuilder
     {
         WvwExportDocument parsed = BuildInternal(log, parserVersion, true);
         WvwExportFight source = parsed.Fights[0];
+        long recordingEndMs = RelativeTime(log.LogData.EvtcLogEnd, log);
+        long eventDomainEndMs = GetEventDomainEndMs(
+            log.LogData.LogDuration, log.LogData.EvtcLogEnd, source.Events);
+        ValidateTemporalBounds(source.DurationMs, recordingEndMs, eventDomainEndMs);
         return new WvwExportV2Document
         {
             SchemaVersion = 2,
@@ -170,8 +175,8 @@ public static class WvwExportBuilder
                     SegmentIndex = source.SegmentIndex,
                     StartedAt = source.StartedAt,
                     DurationMs = source.DurationMs,
-                    EventDomainEndMs = GetEventDomainEndMs(
-                        log.LogData.LogDuration, log.LogData.EvtcLogEnd, source.Events),
+                    RecordingEndMs = recordingEndMs,
+                    EventDomainEndMs = eventDomainEndMs,
                     HealingAvailable = log.CombatData.HasEXTHealing,
                     Build = source.Build,
                     Outcome = source.Outcome,
@@ -230,13 +235,7 @@ public static class WvwExportBuilder
             {
                 return actorId;
             }
-            AgentItem? matchingSlice = agents
-                .Where(candidate => candidate.Agent == agent.Agent &&
-                    (v2 || candidate.InstID == agent.InstID))
-                .Where(candidate => candidate.FirstAware <= time && candidate.LastAware >= time)
-                .OrderBy(candidate => candidate.LastAware - candidate.FirstAware)
-                .ThenBy(candidate => candidate.FirstAware)
-                .FirstOrDefault();
+            AgentItem? matchingSlice = ResolveAwareSlice(agent, time, agents, v2);
             return matchingSlice == null ? null : actorIds[matchingSlice];
         }
 
@@ -328,7 +327,11 @@ public static class WvwExportBuilder
 
             AddStatus(log.CombatData.GetDownEvents(agent), "down", log, ActorId, events);
             AddStatus(log.CombatData.GetDeadEvents(agent), "death", log, ActorId, events);
-            AddStatus(log.CombatData.GetAliveEvents(agent), v2 ? "up" : "alive", log, ActorId, events);
+            if (v2)
+            {
+                ValidateV2UpSemantics(log.CombatData.GetAliveEvents(agent));
+            }
+            AddStatus(log.CombatData.GetAliveEvents(agent), AliveEventKind(v2), log, ActorId, events);
             AddStatus(log.CombatData.GetSpawnEvents(agent), "spawn", log, ActorId, events);
             AddStatus(log.CombatData.GetDespawnEvents(agent), "despawn", log, ActorId, events);
             foreach (HealthUpdateEvent health in log.CombatData.GetHealthUpdateEvents(agent))
@@ -539,6 +542,70 @@ public static class WvwExportBuilder
             throw new InvalidDataException("EVTC recording end precedes the active WvW fight end.");
         }
         return Math.Max(recordingEndMs, events.Select(evt => (long)evt.TimeMs).DefaultIfEmpty(0).Max());
+    }
+
+    /// <summary>
+    /// Requires duration_ms <= recording_end_ms <= event_domain_end_ms. duration_ms is the
+    /// active EI analyzed-fight boundary, recording_end_ms is the raw EVTC recording end, and
+    /// event_domain_end_ms additionally covers canonical EI-derived events that may legitimately
+    /// exceed the raw recording.
+    /// </summary>
+    internal static void ValidateTemporalBounds(
+        long durationMs, long recordingEndMs, long eventDomainEndMs)
+    {
+        if (recordingEndMs < durationMs)
+        {
+            throw new InvalidDataException("EVTC recording end precedes the active WvW fight end.");
+        }
+        if (eventDomainEndMs < recordingEndMs)
+        {
+            throw new InvalidDataException("V2 event domain end precedes the raw EVTC recording end.");
+        }
+    }
+
+    /// <summary>Lifecycle kind projected from EI <see cref="AliveEvent"/>: V2 narrows it to the rally fact.</summary>
+    internal static string AliveEventKind(bool v2) => v2 ? "up" : "alive";
+
+    /// <summary>
+    /// V2 'up' must be exactly the canonical EVTC ChangeUp transition. CombatEventFactory only
+    /// builds AliveEvent from StateChange.ChangeUp, and no custom AliveEvent exists; this verifies
+    /// that provenance at export time instead of trusting the alive-state getter, and fails loudly
+    /// if a broader semantic ever reaches the V2 path.
+    /// </summary>
+    internal static void ValidateV2UpSemantics(IReadOnlyList<AliveEvent> aliveEvents)
+    {
+        foreach (AliveEvent alive in aliveEvents)
+        {
+            if (alive.IsCustom || alive.StateChange != StateChange.ChangeUp)
+            {
+                throw new InvalidDataException(
+                    "V2 'up' events must be the canonical EVTC ChangeUp transition.");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Fallback slice resolution for an event whose agent is outside the primary actor map or
+    /// awareness. Candidates share the raw EVTC agent address (V1 additionally requires the
+    /// instance ID) and must be aware at the event timestamp. V2 refuses ambiguous references
+    /// instead of silently choosing a slice; V1 keeps its certified deterministic selection.
+    /// </summary>
+    internal static AgentItem? ResolveAwareSlice(
+        AgentItem agent, long time, IEnumerable<AgentItem> candidates, bool v2)
+    {
+        List<AgentItem> matching = candidates
+            .Where(candidate => candidate.Agent == agent.Agent &&
+                (v2 || candidate.InstID == agent.InstID))
+            .Where(candidate => candidate.FirstAware <= time && candidate.LastAware >= time)
+            .OrderBy(candidate => candidate.LastAware - candidate.FirstAware)
+            .ThenBy(candidate => candidate.FirstAware)
+            .ToList();
+        if (v2 && matching.Count > 1)
+        {
+            throw new InvalidDataException(
+                $"Ambiguous actor slices for raw EVTC agent address {agent.Agent} at {time} ms; refusing to export an arbitrary actor reference.");
+        }
+        return matching.FirstOrDefault();
     }
 
     internal static bool IsExportableBuffEvent(BuffEvent buff) =>

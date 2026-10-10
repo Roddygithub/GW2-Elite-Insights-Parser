@@ -46,6 +46,8 @@ public sealed record WvwExportV2Fight
     public required int SegmentIndex { get; init; }
     public DateTimeOffset? StartedAt { get; init; }
     public required long DurationMs { get; init; }
+    /// <summary>Raw EVTC recording end relative to the same origin as event timestamps.</summary>
+    public required long RecordingEndMs { get; init; }
     public required long EventDomainEndMs { get; init; }
     public required bool HealingAvailable { get; init; }
     public ulong? Build { get; init; }

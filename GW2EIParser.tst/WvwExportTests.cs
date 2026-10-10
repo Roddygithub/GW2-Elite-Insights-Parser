@@ -2,8 +2,10 @@ using System.Text.Json;
 using GW2EIBuilders;
 using GW2EIJSON;
 using GW2EIParserCommons;
+using GW2EIEvtcParser;
 using GW2EIEvtcParser.ParsedData;
 using NUnit.Framework;
+using static GW2EIEvtcParser.ArcDPSEnums;
 
 namespace GW2EIEvtcParser.tst;
 
@@ -239,6 +241,165 @@ public sealed class WvwExportTests
 
         Assert.That(WvwExportBuilder.TryAddHealingEventOnce(seen, eventRecord), Is.True);
         Assert.That(WvwExportBuilder.TryAddHealingEventOnce(seen, eventRecord), Is.False);
+    }
+
+    [Test]
+    public void ChangeUpAliveEventBecomesExactlyOneV2Up()
+    {
+        AliveEvent changeUp = AliveEventFor(StateChange.ChangeUp);
+
+        Assert.That(changeUp.StateChange, Is.EqualTo(StateChange.ChangeUp));
+        Assert.That(changeUp.IsCustom, Is.False);
+        Assert.DoesNotThrow(() => WvwExportBuilder.ValidateV2UpSemantics([changeUp]));
+        WvwExportEvent up = WvwExportBuilder.CreateLifecycleEvent(
+            WvwExportBuilder.AliveEventKind(v2: true), 100, "a000000");
+        Assert.That(up, Is.TypeOf<WvwUpEvent>());
+        Assert.That(((WvwUpEvent)up).ActorId, Is.EqualTo("a000000"));
+    }
+
+    [Test]
+    public void OrdinaryNonChangeUpAliveEventIsNotAV2Up()
+    {
+        AliveEvent spawn = AliveEventFor(StateChange.Spawn);
+        AliveEvent changeUp = AliveEventFor(StateChange.ChangeUp);
+
+        Assert.That(spawn.StateChange, Is.EqualTo(StateChange.Spawn));
+        Assert.Throws<InvalidDataException>(() => WvwExportBuilder.ValidateV2UpSemantics([spawn]));
+        Assert.Throws<InvalidDataException>(() =>
+            WvwExportBuilder.ValidateV2UpSemantics([changeUp, spawn]));
+    }
+
+    [Test]
+    public void V1AliveProjectionRemainsUnchanged()
+    {
+        Assert.That(WvwExportBuilder.AliveEventKind(v2: false), Is.EqualTo("alive"));
+        Assert.That(WvwExportBuilder.AliveEventKind(v2: true), Is.EqualTo("up"));
+
+        WvwExportEvent v1Alive = WvwExportBuilder.CreateLifecycleEvent(
+            WvwExportBuilder.AliveEventKind(v2: false), 20, "actor");
+        Assert.That(v1Alive, Is.TypeOf<WvwAliveEvent>());
+        JsonElement json = JsonDocument.Parse(JsonSerializer.Serialize(v1Alive, JsonOptions)).RootElement;
+        Assert.That(json.GetProperty("kind").GetString(), Is.EqualTo("alive"));
+        Assert.That(json.GetProperty("target_actor_id").GetString(), Is.EqualTo("actor"));
+        Assert.That(json.TryGetProperty("actor_id", out _), Is.False);
+    }
+
+    [Test]
+    public void ActorFallbackResolvesTheUniqueAwareSlice()
+    {
+        var early = Slice(0xAA, 0, 100);
+        var late = Slice(0xAA, 200, 300);
+
+        Assert.That(
+            WvwExportBuilder.ResolveAwareSlice(early, 250, [early, late], v2: true),
+            Is.SameAs(late));
+        Assert.That(
+            WvwExportBuilder.ResolveAwareSlice(early, 50, [early, late], v2: true),
+            Is.SameAs(early));
+    }
+
+    [Test]
+    public void ActorFallbackWithoutCandidateKeepsNullBehavior()
+    {
+        var agent = Slice(0xAA, 0, 100);
+        var otherAddress = Slice(0xBB, 0, 400);
+        var sameAddressNotAware = Slice(0xAA, 0, 200);
+
+        Assert.That(
+            WvwExportBuilder.ResolveAwareSlice(agent, 250, [otherAddress], v2: true),
+            Is.Null);
+        Assert.That(
+            WvwExportBuilder.ResolveAwareSlice(agent, 250, [sameAddressNotAware], v2: true),
+            Is.Null);
+    }
+
+    [Test]
+    public void V2ActorFallbackRejectsAmbiguousSlices()
+    {
+        var agent = Slice(0xAA, 0, 100);
+        var first = Slice(0xAA, 0, 300);
+        var second = Slice(0xAA, 200, 400);
+
+        Assert.Throws<InvalidDataException>(() =>
+            WvwExportBuilder.ResolveAwareSlice(agent, 250, [first, second], v2: true));
+    }
+
+    [Test]
+    public void V1ActorFallbackKeepsInstanceAndShortestWindowSelection()
+    {
+        var agent = Slice(0xAA, 0, 100, instid: 7);
+        var shortest = Slice(0xAA, 200, 300, instid: 7);
+        var longest = Slice(0xAA, 100, 400, instid: 7);
+        var otherInst = Slice(0xAA, 200, 300, instid: 9);
+
+        Assert.That(
+            WvwExportBuilder.ResolveAwareSlice(agent, 250, [longest, otherInst, shortest], v2: false),
+            Is.SameAs(shortest));
+        Assert.That(
+            WvwExportBuilder.ResolveAwareSlice(agent, 250, [otherInst], v2: false),
+            Is.Null);
+    }
+
+    [Test]
+    public void V2TemporalCaseADurationBeforeRecordingEndEqualToDomain()
+    {
+        long eventDomainEnd = WvwExportBuilder.GetEventDomainEndMs(2_000, 2_100, []);
+
+        Assert.That(eventDomainEnd, Is.EqualTo(2_100));
+        Assert.DoesNotThrow(() => WvwExportBuilder.ValidateTemporalBounds(2_000, 2_100, 2_100));
+    }
+
+    [Test]
+    public void V2TemporalCaseBDurationEqualsRecordingBeforeDomainFromDerivedEvent()
+    {
+        WvwExportEvent derivedTail = WvwExportBuilder.CreateBuffEvent(
+            "buff_remove_single", 56_974, "actor", "actor", -51, 0, 1);
+        long eventDomainEnd = WvwExportBuilder.GetEventDomainEndMs(56_789, 56_789, [derivedTail]);
+
+        Assert.That(eventDomainEnd, Is.EqualTo(56_974));
+        Assert.DoesNotThrow(() => WvwExportBuilder.ValidateTemporalBounds(56_789, 56_789, 56_974));
+    }
+
+    [Test]
+    public void V2TemporalCaseCDurationBeforeRecordingBeforeDomain()
+    {
+        WvwExportEvent derivedTail = WvwExportBuilder.CreateBuffEvent(
+            "buff_remove_single", 2_200, "actor", "actor", -51, 0, 1);
+        long eventDomainEnd = WvwExportBuilder.GetEventDomainEndMs(2_000, 2_100, [derivedTail]);
+
+        Assert.That(eventDomainEnd, Is.EqualTo(2_200));
+        Assert.DoesNotThrow(() => WvwExportBuilder.ValidateTemporalBounds(2_000, 2_100, 2_200));
+    }
+
+    [Test]
+    public void V2TemporalCaseDRecordingEndBeforeDurationIsRejected()
+    {
+        Assert.Throws<InvalidDataException>(() =>
+            WvwExportBuilder.ValidateTemporalBounds(2_000, 1_999, 1_999));
+        Assert.Throws<InvalidDataException>(() => WvwExportBuilder.GetEventDomainEndMs(100, 99, []));
+    }
+
+    [Test]
+    public void V2TemporalCaseEDomainBeforeRecordingEndIsRejected()
+    {
+        Assert.Throws<InvalidDataException>(() =>
+            WvwExportBuilder.ValidateTemporalBounds(2_000, 2_100, 2_099));
+    }
+
+    private static CombatItem StateChangeItem(
+        StateChange stateChange, long time = 100, ulong srcAgent = 0x1234) => new(
+        time, srcAgent, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        (byte)stateChange, 0, 0, 0, 0, new EvtcVersionEvent(0));
+
+    private static AgentItem Slice(
+        ulong address, long firstAware, long lastAware, ushort instid = 1, string name = "slice") => new(
+        address, name, ParserHelper.Spec.NPC, -1, AgentItem.AgentType.Player,
+        instid, 0, 0, 0, 0, 0, 0, firstAware, lastAware, false);
+
+    private static AliveEvent AliveEventFor(StateChange stateChange)
+    {
+        var agentData = new AgentData(null!, [Slice(0x1234, 0, long.MaxValue)]);
+        return new AliveEvent(StateChangeItem(stateChange), agentData);
     }
 
     private static TestActor Actor(
