@@ -9,6 +9,11 @@ namespace GW2EIEvtcParser.ParsedData;
 
 public class AgentItem
 {
+    public sealed record OwnershipObservation(long Time, AgentItem Owner);
+
+    private readonly List<OwnershipObservation> _ownershipObservations = [];
+    public IReadOnlyList<OwnershipObservation> OwnershipObservations => _ownershipObservations;
+
     public struct MergedAgentItem
     {
         internal MergedAgentItem(AgentItem merged, long start, long end)
@@ -138,6 +143,7 @@ public class AgentItem
         HitboxHeight = other.HitboxHeight;
         InstID = other.InstID;
         Master = other.Master;
+        _ownershipObservations.AddRange(other._ownershipObservations);
         IsFake = other.IsFake;
         Unamed = other.Unamed;
         IsNotInSquadFriendlyPlayer = other.IsNotInSquadFriendlyPlayer;
@@ -229,6 +235,13 @@ public class AgentItem
     {
         FirstAware -= offset;
         LastAware -= offset;
+        for (int index = 0; index < _ownershipObservations.Count; index++)
+        {
+            _ownershipObservations[index] = _ownershipObservations[index] with
+            {
+                Time = _ownershipObservations[index].Time - offset,
+            };
+        }
         foreach (var merge in Merges)
         {
             merge.ApplyOffset(offset);
@@ -251,6 +264,12 @@ public class AgentItem
             }
         }
         Master = master.EnglobingAgentItem;
+    }
+
+    internal void RecordMaster(long time, AgentItem master)
+    {
+        SetMaster(master);
+        _ownershipObservations.Add(new OwnershipObservation(time, master.EnglobingAgentItem));
     }
 
     internal AgentItem GetMainAgentWhenAttackTarget(ParsedEvtcLog log)

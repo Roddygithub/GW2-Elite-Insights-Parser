@@ -17,6 +17,7 @@ public class ProgramSettings
     public bool SaveOutCSV { get; set; } = false;
     public bool SaveOutHTML { get; set; } = true;
     public bool SaveOutJSON { get; set; } = false;
+    public bool SaveOutWvwExport { get; set; } = false;
     public bool SaveOutTrace { get; set; } = false;
     // Multi threading
     public bool ParseMultipleLogs { get; set; } = false;
@@ -78,7 +79,7 @@ public class ProgramSettings
 
     public bool HasFormat()
     {
-        return SaveOutCSV || SaveOutHTML || SaveOutJSON;
+        return SaveOutCSV || SaveOutHTML || SaveOutJSON || SaveOutWvwExport;
     }
 
     public bool DoParseMultipleLogs()

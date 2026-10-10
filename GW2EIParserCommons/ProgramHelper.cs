@@ -56,6 +56,11 @@ public sealed class ProgramHelper : IDisposable
     }
 
     internal readonly static HTMLAssets htmlAssets = new();
+    private static readonly System.Text.Json.JsonSerializerOptions WvwExportJsonOptions = new()
+    {
+        PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.CamelCase,
+        WriteIndented = true,
+    };
 
     public ProgramSettings Settings { get; private set; }
     private readonly Version ParserVersion;
@@ -583,6 +588,17 @@ public sealed class ProgramHelper : IDisposable
 
                 operation.UpdateProgressWithCancellationCheck("Program: JSON created");
             }
+        }
+        if (Settings.SaveOutWvwExport)
+        {
+            operation.UpdateProgressWithCancellationCheck("Program: Creating WvW export");
+            string outputFile = Path.Combine(saveDirectory.FullName, $"{fName}_wvw_export_v1.json");
+            var export = WvwExportBuilder.Build(log, ParserVersion);
+            using (var stream = new FileStream(outputFile, FileMode.Create, FileAccess.Write))
+            {
+                System.Text.Json.JsonSerializer.Serialize(stream, export, WvwExportJsonOptions);
+            }
+            operation.AddFile(outputFile);
         }
         operation.UpdateProgressWithCancellationCheck($"Completed for {resultStr} {log.LogData.Logic.Extension}");
     }

@@ -1016,7 +1016,7 @@ public class EvtcParser
             AgentItem minion = _agentData.GetAgent(minionAgent, logTime);
             if (!minion.IsUnknown)
             {
-                minion.SetMaster(master);
+                minion.RecordMaster(logTime, master);
             }
         }
     }
