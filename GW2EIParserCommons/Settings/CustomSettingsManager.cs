@@ -145,6 +145,7 @@ public static class CustomSettingsManager
             SaveOutHTML = Properties.Settings.Default.SaveOutHTML,
             SaveOutJSON = Properties.Settings.Default.SaveOutJSON,
             SaveOutWvwExport = Properties.Settings.Default.SaveOutWvwExport,
+            SaveOutWvwExportV2 = Properties.Settings.Default.SaveOutWvwExportV2,
             SaveOutTrace = Properties.Settings.Default.SaveOutTrace,
             ParseMultipleLogs = Properties.Settings.Default.ParseMultipleLogs,
             SingleThreaded = Properties.Settings.Default.SingleThreaded,

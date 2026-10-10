@@ -3,6 +3,7 @@ using GW2EIEvtcParser;
 using GW2EIEvtcParser.EIData;
 using GW2EIEvtcParser.ParsedData;
 using GW2EIEvtcParser.LogLogic;
+using GW2EIEvtcParser.Extensions;
 using GW2EIJSON;
 
 namespace GW2EIBuilders;
@@ -52,6 +53,8 @@ public static class WvwExportBuilder
                 {
                     WvwDamageEvent damageSource => damageSource.SourceActorId,
                     WvwBuffEvent buffSource => buffSource.SourceActorId,
+                    WvwHealingEvent healingSource => healingSource.SourceActorId,
+                    WvwCCEvent ccSource => ccSource.SourceActorId,
                     _ => null,
                 },
                 Target: evt switch
@@ -59,19 +62,26 @@ public static class WvwExportBuilder
                     WvwDamageEvent damageTarget => damageTarget.TargetActorId,
                     WvwBuffEvent buffTarget => buffTarget.TargetActorId,
                     WvwLifecycleEvent lifecycle => lifecycle.TargetActorId,
+                    WvwHealingEvent healingTarget => healingTarget.TargetActorId,
+                    WvwCCEvent ccTarget => ccTarget.TargetActorId,
+                    WvwUpEvent up => up.ActorId,
                     _ => null,
                 },
                 Skill: evt switch
                 {
                     WvwDamageEvent damageSkill => damageSkill.SkillId,
                     WvwBuffEvent buffSkill => buffSkill.BuffId,
+                    WvwHealingEvent healingSkill => healingSkill.SkillId,
+                    WvwCCEvent ccSkill => ccSkill.SkillId,
                     _ => (long?)null,
                 },
                 Damage: evt is WvwDamageEvent damageValue ? damageValue.Damage : (long?)null,
                 ShieldDamage: evt is WvwDamageEvent shieldValue ? shieldValue.ShieldDamage : (long?)null,
                 Duration: evt is WvwBuffEvent buff ? buff.DurationMs : (long?)null,
                 Stacks: evt is WvwBuffRemovalEvent removal ? removal.RemovedStacks : (int?)null,
-                Health: evt is WvwHealthUpdateEvent health ? health.HealthPercent : (double?)null))
+                Health: evt is WvwHealthUpdateEvent health ? health.HealthPercent : (double?)null,
+                Healing: evt is WvwHealingEvent healingValue ? healingValue.Amount : (int?)null,
+                CC: evt is WvwCCEvent ccValue ? ccValue.DurationMs : (int?)null))
             .OrderBy(x => x.Event.TimeMs)
             .ThenBy(x => x.Event.Kind, StringComparer.Ordinal)
             .ThenBy(x => x.Source, StringComparer.Ordinal)
@@ -82,6 +92,8 @@ public static class WvwExportBuilder
             .ThenBy(x => x.Duration)
             .ThenBy(x => x.Stacks)
             .ThenBy(x => x.Health)
+            .ThenBy(x => x.Healing)
+            .ThenBy(x => x.CC)
             .Select((value, index) => value.Event with { Sequence = index })
             .ToList();
     }
@@ -134,7 +146,59 @@ public static class WvwExportBuilder
             .ToList(), sourceList.Count, sameTimeCollisions);
     }
 
-    public static WvwExportDocument Build(ParsedEvtcLog log, Version parserVersion)
+    public static WvwExportDocument Build(ParsedEvtcLog log, Version parserVersion) =>
+        BuildInternal(log, parserVersion, false);
+
+    public static WvwExportV2Document BuildV2(ParsedEvtcLog log, Version parserVersion)
+    {
+        WvwExportDocument parsed = BuildInternal(log, parserVersion, true);
+        WvwExportFight source = parsed.Fights[0];
+        return new WvwExportV2Document
+        {
+            SchemaVersion = 2,
+            ParserVersion = parsed.ParserVersion,
+            SourceCommit = parsed.SourceCommit,
+            ConfigSha256 = parsed.ConfigSha256,
+            SessionId = parsed.SessionId,
+            SourceLogCount = parsed.SourceLogCount,
+            Fights =
+            [
+                new WvwExportV2Fight
+                {
+                    FightId = source.FightId,
+                    SourceLogIndex = source.SourceLogIndex,
+                    SegmentIndex = source.SegmentIndex,
+                    StartedAt = source.StartedAt,
+                    DurationMs = source.DurationMs,
+                    EventDomainEndMs = GetEventDomainEndMs(
+                        log.LogData.LogDuration, log.LogData.EvtcLogEnd),
+                    HealingAvailable = log.CombatData.HasEXTHealing,
+                    Build = source.Build,
+                    Outcome = source.Outcome,
+                    Actors = source.Actors.Select(actor => new WvwExportV2Actor
+                    {
+                        ActorId = actor.ActorId,
+                        Kind = actor.Kind,
+                        Name = actor.Name,
+                        Account = actor.Account,
+                        Subgroup = actor.Subgroup,
+                        Profession = actor.Profession,
+                        EliteSpec = actor.EliteSpec,
+                        SpeciesId = actor.SpeciesId,
+                        FirstAwareMs = actor.FirstAwareMs,
+                        LastAwareMs = actor.LastAwareMs,
+                    }).ToList(),
+                    Events = source.Events,
+                    OwnershipIntervals = source.OwnershipIntervals,
+                    OwnershipObservationCount = source.OwnershipObservationCount,
+                    OwnershipSameTimeCollisionCount = source.OwnershipSameTimeCollisionCount,
+                    PositionSamples = source.PositionSamples,
+                },
+            ],
+        };
+    }
+
+    private static WvwExportDocument BuildInternal(ParsedEvtcLog log, Version parserVersion, bool v2)
     {
         if (!log.ParserSettings.DetailedWvWParse || log.LogData.Logic.ParseMode != LogLogic.ParseModeEnum.WvW)
         {
@@ -143,14 +207,15 @@ public static class WvwExportBuilder
 
         var actorAssignments = AssignActorIds(
             Enum.GetValues<AgentItem.AgentType>().SelectMany(log.AgentData.GetAgentByType).Distinct(),
-            agent => new ActorOrderKey(
+            agent => CreateActorOrderKey(
                 agent.FirstAware,
                 agent.LastAware,
                 agent.Type,
                 agent.InstID,
                 agent.ID,
                 agent.Name,
-                agent.Agent));
+                agent.Agent,
+                v2));
         var agents = actorAssignments.Select(x => x.Agent).ToList();
         var actorIds = actorAssignments.ToDictionary(x => x.Agent, x => x.ActorId);
         var agentByActorId = actorAssignments.ToDictionary(x => x.ActorId, x => x.Agent, StringComparer.Ordinal);
@@ -166,7 +231,8 @@ public static class WvwExportBuilder
                 return actorId;
             }
             AgentItem? matchingSlice = agents
-                .Where(candidate => candidate.Agent == agent.Agent && candidate.InstID == agent.InstID)
+                .Where(candidate => candidate.Agent == agent.Agent &&
+                    (v2 || candidate.InstID == agent.InstID))
                 .Where(candidate => candidate.FirstAware <= time && candidate.LastAware >= time)
                 .OrderBy(candidate => candidate.LastAware - candidate.FirstAware)
                 .ThenBy(candidate => candidate.FirstAware)
@@ -204,7 +270,7 @@ public static class WvwExportBuilder
                 EliteSpec = agent.IsPlayer && agent.Spec != ParserHelper.Spec.Unknown && agent.Spec != agent.BaseSpec
                     ? agent.Spec.ToString()
                     : null,
-                InstanceId = agent.InstID == 0 ? null : agent.InstID,
+                InstanceId = v2 || agent.InstID == 0 ? null : agent.InstID,
                 SpeciesId = agent.ID < 0 ? null : agent.ID,
                 FirstAwareMs = RelativeTime(agent.FirstAware, log),
                 LastAwareMs = RelativeTime(agent.LastAware, log),
@@ -213,6 +279,32 @@ public static class WvwExportBuilder
 
         var events = new List<WvwExportEvent>();
         var seenBuffEvents = new HashSet<object>(ReferenceEqualityComparer.Instance);
+        var seenHealingEvents = new HashSet<object>(ReferenceEqualityComparer.Instance);
+        var seenCcEvents = new HashSet<object>(ReferenceEqualityComparer.Instance);
+        void AddHealingEvent(EXTHealingEvent healing)
+        {
+            if (TryAddHealingEventOnce(seenHealingEvents, healing))
+            {
+                events.Add(CreateHealingEvent(
+                    Time(healing.Time, log),
+                    ActorId(healing.From, healing.Time),
+                    ActorId(healing.To, healing.Time),
+                    healing.SkillID,
+                    healing.HealingDone));
+            }
+        }
+        void AddCcEvent(CrowdControlEvent cc)
+        {
+            if (seenCcEvents.Add(cc))
+            {
+                events.Add(CreateCCEvent(
+                    Time(cc.Time, log),
+                    ActorId(cc.From, cc.Time),
+                    ActorId(cc.To, cc.Time),
+                    cc.SkillID,
+                    cc.Duration));
+            }
+        }
         foreach (AgentItem agent in agents)
         {
             foreach (HealthDamageEvent damage in log.CombatData.GetDamageData(agent))
@@ -236,7 +328,7 @@ public static class WvwExportBuilder
 
             AddStatus(log.CombatData.GetDownEvents(agent), "down", log, ActorId, events);
             AddStatus(log.CombatData.GetDeadEvents(agent), "death", log, ActorId, events);
-            AddStatus(log.CombatData.GetAliveEvents(agent), "alive", log, ActorId, events);
+            AddStatus(log.CombatData.GetAliveEvents(agent), v2 ? "up" : "alive", log, ActorId, events);
             AddStatus(log.CombatData.GetSpawnEvents(agent), "spawn", log, ActorId, events);
             AddStatus(log.CombatData.GetDespawnEvents(agent), "despawn", log, ActorId, events);
             foreach (HealthUpdateEvent health in log.CombatData.GetHealthUpdateEvents(agent))
@@ -246,6 +338,30 @@ public static class WvwExportBuilder
                     Time(health.Time, log),
                     ActorId(health.Src, health.Time),
                     health.HealthPercent));
+            }
+
+            if (v2 && log.CombatData.HasEXTHealing)
+            {
+                foreach (var healing in log.CombatData.EXTHealingCombatData.GetHealData(agent))
+                {
+                    AddHealingEvent(healing);
+                }
+                foreach (var healing in log.CombatData.EXTHealingCombatData.GetHealReceivedData(agent))
+                {
+                    AddHealingEvent(healing);
+                }
+            }
+
+            if (v2)
+            {
+                foreach (CrowdControlEvent cc in log.CombatData.GetOutgoingCrowdControlData(agent))
+                {
+                    AddCcEvent(cc);
+                }
+                foreach (CrowdControlEvent cc in log.CombatData.GetIncomingCrowdControlData(agent))
+                {
+                    AddCcEvent(cc);
+                }
             }
         }
 
@@ -304,6 +420,8 @@ public static class WvwExportBuilder
             {
                 WvwDamageEvent damage => damage.SourceActorId,
                 WvwBuffEvent buff => buff.SourceActorId,
+                WvwHealingEvent healing => healing.SourceActorId,
+                WvwCCEvent cc => cc.SourceActorId,
                 _ => null,
             };
             string? targetId = evt switch
@@ -311,6 +429,9 @@ public static class WvwExportBuilder
                 WvwDamageEvent damage => damage.TargetActorId,
                 WvwBuffEvent buff => buff.TargetActorId,
                 WvwLifecycleEvent lifecycle => lifecycle.TargetActorId,
+                WvwHealingEvent healing => healing.TargetActorId,
+                WvwCCEvent cc => cc.TargetActorId,
+                WvwUpEvent up => up.ActorId,
                 _ => null,
             };
             if (sourceId != null) referencedActorIds.Add(sourceId);
@@ -380,7 +501,44 @@ public static class WvwExportBuilder
         ShieldDamage = shieldDamage,
     };
 
+    internal static ActorOrderKey CreateActorOrderKey(
+        long firstAware, long lastAware, AgentItem.AgentType type, ushort instanceId,
+        int speciesId, string name, ulong sourceAgent, bool omitInstanceId = false) => new(
+            firstAware, lastAware, type, omitInstanceId ? (ushort)0 : instanceId,
+            speciesId, name, sourceAgent);
+
+    internal static WvwHealingEvent CreateHealingEvent(
+        int timeMs, string? sourceActorId, string? targetActorId, long skillId, int amount) => new()
+    {
+        TimeMs = timeMs,
+        SourceActorId = sourceActorId,
+        TargetActorId = targetActorId,
+        SkillId = skillId,
+        Amount = amount,
+    };
+
+    internal static WvwCCEvent CreateCCEvent(
+        int timeMs, string? sourceActorId, string? targetActorId, long skillId, int durationMs) => new()
+    {
+        TimeMs = timeMs,
+        SourceActorId = sourceActorId,
+        TargetActorId = targetActorId,
+        SkillId = skillId,
+        DurationMs = durationMs,
+    };
+
     internal static bool TryAddBuffEventOnce(HashSet<object> seen, object buff) => seen.Add(buff);
+
+    internal static bool TryAddHealingEventOnce(HashSet<object> seen, object healing) => seen.Add(healing);
+
+    internal static long GetEventDomainEndMs(long activeFightEndMs, long recordingEndMs)
+    {
+        if (recordingEndMs < activeFightEndMs)
+        {
+            throw new InvalidDataException("EVTC recording end precedes the active WvW fight end.");
+        }
+        return recordingEndMs;
+    }
 
     internal static bool IsExportableBuffEvent(BuffEvent buff) =>
         IsExportableBuffEventType(buff.GetType(), buff.BuffID);
@@ -397,6 +555,7 @@ public static class WvwExportBuilder
         "down" => new WvwDownEvent { TimeMs = timeMs, TargetActorId = targetActorId },
         "death" => new WvwDeathEvent { TimeMs = timeMs, TargetActorId = targetActorId },
         "alive" => new WvwAliveEvent { TimeMs = timeMs, TargetActorId = targetActorId },
+        "up" => new WvwUpEvent { TimeMs = timeMs, ActorId = targetActorId },
         "spawn" => new WvwSpawnEvent { TimeMs = timeMs, TargetActorId = targetActorId },
         "despawn" => new WvwDespawnEvent { TimeMs = timeMs, TargetActorId = targetActorId },
         "health_update" => new WvwHealthUpdateEvent

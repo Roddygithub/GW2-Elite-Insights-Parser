@@ -266,7 +266,7 @@ public sealed class ProgramHelper : IDisposable
                             ComputeMechanics = true,
                             ComputePhases = true,
                             DetailedWvWParse = Settings.DetailledWvW,
-                            CaptureOwnershipObservations = Settings.SaveOutWvwExport,
+                            CaptureOwnershipObservations = Settings.SaveOutWvwExport || Settings.SaveOutWvwExportV2,
                             ParseExtensions = true,
                             ComputeDamageModifiers = true,
                             ComputeBuff = true,
@@ -376,7 +376,7 @@ public sealed class ProgramHelper : IDisposable
                 ComputeCast = Settings.ComputeCast,
                 ComputeMechanics = Settings.ComputeMechanics,
                 DetailedWvWParse = Settings.DetailledWvW,
-                CaptureOwnershipObservations = Settings.SaveOutWvwExport,
+                CaptureOwnershipObservations = Settings.SaveOutWvwExport || Settings.SaveOutWvwExportV2,
             },
                                         APIController);
 
@@ -596,6 +596,17 @@ public sealed class ProgramHelper : IDisposable
             operation.UpdateProgressWithCancellationCheck("Program: Creating WvW export");
             string outputFile = Path.Combine(saveDirectory.FullName, $"{fName}_wvw_export_v1.json");
             var export = WvwExportBuilder.Build(log, ParserVersion);
+            using (var stream = new FileStream(outputFile, FileMode.Create, FileAccess.Write))
+            {
+                System.Text.Json.JsonSerializer.Serialize(stream, export, WvwExportJsonOptions);
+            }
+            operation.AddFile(outputFile);
+        }
+        if (Settings.SaveOutWvwExportV2)
+        {
+            operation.UpdateProgressWithCancellationCheck("Program: Creating WvW export V2");
+            string outputFile = Path.Combine(saveDirectory.FullName, $"{fName}_wvw_export_v2.json");
+            var export = WvwExportBuilder.BuildV2(log, ParserVersion);
             using (var stream = new FileStream(outputFile, FileMode.Create, FileAccess.Write))
             {
                 System.Text.Json.JsonSerializer.Serialize(stream, export, WvwExportJsonOptions);

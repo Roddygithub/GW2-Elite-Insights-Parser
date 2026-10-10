@@ -161,6 +161,62 @@ public sealed class WvwExportTests
             Is.EqualTo(("actor", 12, 1.25f, -2.5f, 3.75f)));
     }
 
+    [Test]
+    public void V2ActorOrderingIgnoresUnstableInstanceMetadata()
+    {
+        var first = WvwExportBuilder.CreateActorOrderKey(
+            10, 100, AgentItem.AgentType.Player, 123, 42, "same", 0x1234, omitInstanceId: true);
+        var repeatedParse = WvwExportBuilder.CreateActorOrderKey(
+            10, 100, AgentItem.AgentType.Player, 999, 42, "same", 0x1234, omitInstanceId: true);
+
+        Assert.That(first, Is.EqualTo(repeatedParse));
+    }
+
+    [Test]
+    public void V2HealingUpAndCcKeepCanonicalFieldsSeparate()
+    {
+        WvwExportEvent healing = WvwExportBuilder.CreateHealingEvent(10, "source", "target", -5, 125);
+        WvwExportEvent up = WvwExportBuilder.CreateLifecycleEvent("up", 20, "target");
+        WvwExportEvent cc = WvwExportBuilder.CreateCCEvent(30, "source", "target", 7, 400);
+
+        Assert.That(healing, Is.TypeOf<WvwHealingEvent>());
+        Assert.That(((WvwHealingEvent)healing).Amount, Is.EqualTo(125));
+        Assert.That(((WvwHealingEvent)healing).SkillId, Is.EqualTo(-5));
+        Assert.That(up, Is.TypeOf<WvwUpEvent>());
+        Assert.That(((WvwUpEvent)up).ActorId, Is.EqualTo("target"));
+        Assert.That(cc, Is.TypeOf<WvwCCEvent>());
+        Assert.That(((WvwCCEvent)cc).DurationMs, Is.EqualTo(400));
+
+        JsonElement healingJson = JsonDocument.Parse(JsonSerializer.Serialize(healing, JsonOptions)).RootElement;
+        JsonElement upJson = JsonDocument.Parse(JsonSerializer.Serialize(up, JsonOptions)).RootElement;
+        JsonElement ccJson = JsonDocument.Parse(JsonSerializer.Serialize(cc, JsonOptions)).RootElement;
+        Assert.That(healingJson.GetProperty("kind").GetString(), Is.EqualTo("healing"));
+        Assert.That(healingJson.TryGetProperty("duration_ms", out _), Is.False);
+        Assert.That(upJson.GetProperty("kind").GetString(), Is.EqualTo("up"));
+        Assert.That(upJson.TryGetProperty("source_actor_id", out _), Is.False);
+        Assert.That(ccJson.GetProperty("kind").GetString(), Is.EqualTo("cc"));
+        Assert.That(ccJson.TryGetProperty("amount", out _), Is.False);
+    }
+
+    [Test]
+    public void V2EventDomainRetainsEventsAfterActiveFightEnd()
+    {
+        long eventDomainEnd = WvwExportBuilder.GetEventDomainEndMs(56_789, 57_100);
+
+        Assert.That(56_974, Is.GreaterThan(56_789).And.LessThanOrEqualTo(eventDomainEnd));
+        Assert.Throws<InvalidDataException>(() => WvwExportBuilder.GetEventDomainEndMs(100, 99));
+    }
+
+    [Test]
+    public void V2HealingDeduplicatesSharedSourceAndRecipientIndexes()
+    {
+        var seen = new HashSet<object>(ReferenceEqualityComparer.Instance);
+        object eventRecord = new();
+
+        Assert.That(WvwExportBuilder.TryAddHealingEventOnce(seen, eventRecord), Is.True);
+        Assert.That(WvwExportBuilder.TryAddHealingEventOnce(seen, eventRecord), Is.False);
+    }
+
     private static TestActor Actor(string name, long firstAware, ulong sourceAgent) => new(
         name,
         new WvwExportBuilder.ActorOrderKey(

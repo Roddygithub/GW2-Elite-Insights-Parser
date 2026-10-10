@@ -312,6 +312,15 @@ public sealed partial class Settings : global::System.Configuration.ApplicationS
     [global::System.Configuration.UserScopedSettingAttribute()]
     [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
     [global::System.Configuration.DefaultSettingValueAttribute("False")]
+    public bool SaveOutWvwExportV2
+    {
+        get => (bool)this[nameof(SaveOutWvwExportV2)];
+        set => this[nameof(SaveOutWvwExportV2)] = value;
+    }
+
+    [global::System.Configuration.UserScopedSettingAttribute()]
+    [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
+    [global::System.Configuration.DefaultSettingValueAttribute("False")]
     public bool IndentJSON
     {
         get
